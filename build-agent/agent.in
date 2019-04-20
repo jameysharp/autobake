@@ -1,0 +1,26 @@
+#!/bin/sh
+
+tracedir=$(@mktemp@ -d --tmpdir autobake-XXXXXXXXXX) || exit
+trap '@rm@ -rf "$tracedir"' EXIT || exit
+
+# strace flags, in order:
+# - write a separate log file for each process
+# - trace syscalls that take filename arguments, as well as recording which
+#   parent forked each new process
+# - but don't trace process exit status or signals
+# - display complete environment for execve (with reasonable string length
+#   limits), but don't dereference anything else
+# - don't bother aligning return values, we ignore whitespace
+@strace@ \
+	-ff -o "$tracedir/strace-log" \
+	-e %file,fork,vfork,clone \
+	-qq -e signal=none \
+	-e abbrev=!execve -e verbose=execve -s 4096 \
+	-a 0 \
+	"$@"
+
+exitcode=$?
+
+@postbuild@ "$tracedir/strace-log"
+
+exit "$exitcode"

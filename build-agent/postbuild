@@ -1,0 +1,255 @@
+#!/usr/bin/env python
+
+from pathlib import Path
+import re
+import shlex
+
+
+SYSCALL_PATTERN = re.compile(r"""
+    (?P<name>\w+) # syscall name
+    \(
+    (?P<args>.*) # syscall arguments
+    \) \s* = \s*
+    (?P<return>-?\d+) # return status
+    (?:\s*
+        (?P<errno>\w+) # errno symbol
+        \s* \(
+            [^)]* # errno long description
+        \)
+    )? # errno info is only present for error return statuses
+""", re.ASCII | re.VERBOSE)
+
+FORK_SYSCALLS = frozenset(('fork', 'vfork', 'clone'))
+
+STRING_PATTERN = re.compile(r'("(?:\\.|[^\\"])*"(?:\.\.\.)?|[\[\]])')
+
+
+def extract_syscall_args(args):
+    array = None
+    for s in STRING_PATTERN.split(args):
+        if not s:
+            continue
+
+        if s[0] == '"':
+            s = s[1:]
+            if s.endswith('"...'):
+                s = s[:-4] + '...'
+            else:
+                s = s[:-1]
+
+            if array is None:
+                yield s
+            else:
+                array.append(s)
+            continue
+
+        if s[0] == ']':
+            yield array
+            array = None
+
+        if s[-1] == '[':
+            array = []
+
+
+def parse_one_trace(log):
+    for line in log:
+        syscall = SYSCALL_PATTERN.fullmatch(line.rstrip("\r\n"))
+        if not syscall:
+            continue
+
+        if syscall['name'] in FORK_SYSCALLS:
+            if not syscall['errno']:
+                yield (True, 'fork', syscall['return'])
+            continue
+
+        if syscall['name'] == 'execve':
+            filename, argv, environ = extract_syscall_args(syscall['args'])
+            if not syscall['errno']:
+                argv = ' '.join(map(shlex.quote, argv))
+                yield (True, 'exec', Path(filename), {'environ': environ, 'argv': [argv]})
+                continue
+        else:
+            filename = next(extract_syscall_args(syscall['args']), None)
+            if not filename:
+                continue
+
+        yield (not syscall['errno'], 'find', Path(filename))
+
+
+if __name__ == "__main__":
+    from collections import defaultdict
+    import fnmatch
+    import itertools
+    import os
+    import re
+    import sys
+
+    ignore_filenames = (
+        'ld.so.cache',
+
+        # revision control systems
+        '.bzr',
+        '.git',
+        '.hg',
+        '.svn',
+        'CVS',
+        'RCS',
+        'SCCS',
+
+        # autoconf expected-failure
+        'ac_nonexistent.h',
+
+        # GCC
+        '*.gch',
+        '*.rpo',
+
+        # for anything except Windows targets:
+        '*.exe',
+
+        # nix-specific:
+        '_callImplicitHook *',
+        'if *; then *; fi',
+        'include',
+        'include-fixed',
+        'specs',
+
+        # all nixpkgs runHook/runOneHook targets:
+        'fixupOutput',
+        'addInputsHook',
+        'commonPhase',
+        'exitHook',
+        'failureHook',
+        'postAutoreconf',
+        'postBuild',
+        'postCheck',
+        'postCompileBuildDriver',
+        'postConfigure',
+        'postDist',
+        'postFetch',
+        'postFixup',
+        'postHaddock',
+        'postHook',
+        'postInstall',
+        'postInstallCheck',
+        'postPatch',
+        'postSetupCompilerEnvironment',
+        'postSetupPhase',
+        'postUnpack',
+        'postUnpackGog',
+        'preAutoreconf',
+        'preBuild',
+        'preCheck',
+        'preCompileBuildDriver',
+        'preConfigure',
+        'preDist',
+        'preFixup',
+        'preHaddock',
+        'preHook',
+        'preInstall',
+        'preInstallCheck',
+        'prePatch',
+        'preRebuild',
+        'preSetupCompilerEnvironment',
+        'preSetupPhase',
+        'preUnpack',
+        'preUnpackGog',
+        'renameImports',
+        'unpackPhase',
+        'userHook',
+        'unpackCmd',
+        'setSourceRoot',
+        # see nixpkgs/pkgs/stdenv/generic/setup.sh:addEnvHooks
+        'envBuildBuildHook',
+        'envBuildHostHook',
+        'envBuildTargetHook',
+        'envHostHostHook',
+        'envHostTargetHook',
+        'envTargetTargetHook',
+    )
+
+    ignore_pathnames = (
+        r'^/dev/',
+        r'^/tmp/',
+
+        # for anything except OS X targets:
+        r'/CoreFoundation(?:$|/)',
+        r'/Library/Frameworks(?:$|/)',
+
+        # nix-specific:
+        r'/nix-support/[^/]*$',
+        r'^/build/',
+    )
+
+    ignore_filenames = re.compile('|'.join(map(fnmatch.translate, ignore_filenames)))
+    ignore_pathnames = re.compile('|'.join(ignore_pathnames))
+
+    d = Path(sys.argv[1])
+    os.chdir(d.parent)
+    base = d.name + '.'
+
+    traces = {}
+    with os.scandir() as it:
+        for entry in it:
+            assert entry.name.startswith(base)
+            pid = entry.name[len(base):]
+            with open(entry.name) as log:
+                traces[pid] = list(parse_one_trace(log))
+
+    trace = itertools.chain.from_iterable(traces.values())
+
+    parents = set()
+    for event in trace:
+        if event[1] != 'fork':
+            parents.update(event[2].parents)
+
+    trace = itertools.chain.from_iterable(traces.values())
+
+    found = [defaultdict(set), defaultdict(set)]
+    for event in trace:
+        p = event[2]
+        if event[1] == 'fork':
+            pass
+        elif ignore_filenames.fullmatch(p.name) or ignore_pathnames.search(str(p)):
+            pass
+        elif p not in parents:
+            found[event[0]][p.name].add(p.parent)
+
+    singletons = []
+    searches = defaultdict(list)
+    for filename, searched in sorted(found[False].items()):
+        if filename in found[True]:
+            continue
+
+        searched = sorted(searched)
+        if len(searched) == 1:
+            singletons.append(str(searched.pop() / filename))
+            continue
+
+        while True:
+            g = itertools.groupby(searched, key=lambda parent: parent.name)
+            common_parent, v = next(g)
+            if next(g, False):
+                break
+            filename = Path(common_parent, filename)
+            searched = [parent.parent for parent in searched]
+
+        searched = tuple(map(str, searched))
+        searches[searched].append(str(filename))
+
+    print()
+    print('===== begin autobake-agent summary =====')
+
+    print('not found:')
+    for path in sorted(singletons):
+        print(' -', shlex.quote(path))
+
+    for searched, filenames in sorted(searches.items()):
+        print()
+        print('looked in:')
+        for parent in searched:
+            print(' -', shlex.quote(parent))
+        print('but did not find:')
+        for filename in filenames:
+            print(' -', shlex.quote(filename))
+
+    print('===== end autobake-agent summary =====')
