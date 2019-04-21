@@ -86,6 +86,7 @@ if __name__ == "__main__":
 
     ignore_filenames = (
         'ld.so.cache',
+        'pkgconfig',
 
         # revision control systems
         '.bzr',
@@ -109,8 +110,11 @@ if __name__ == "__main__":
         # nix-specific:
         '_callImplicitHook *',
         'if *; then *; fi',
+        'bin',
         'include',
         'include-fixed',
+        'lib',
+        'lib64',
         'specs',
 
         # all nixpkgs runHook/runOneHook targets:
@@ -170,6 +174,11 @@ if __name__ == "__main__":
     ignore_pathnames = (
         r'^/dev/',
         r'^/tmp/',
+        r'^/sys/',
+        r'^/proc/',
+
+        # GCC:
+        r'/lib/gcc/',
 
         # for anything except OS X targets:
         r'/CoreFoundation(?:$|/)',
@@ -178,6 +187,7 @@ if __name__ == "__main__":
         # nix-specific:
         r'/nix-support/[^/]*$',
         r'^/build/',
+        r'^/etc/',
     )
 
     ignore_filenames = re.compile('|'.join(map(fnmatch.translate, ignore_filenames)))
