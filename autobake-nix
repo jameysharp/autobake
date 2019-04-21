@@ -1,0 +1,158 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3
+
+from contextlib import closing
+import subprocess
+
+
+def instantiate(*args):
+    """
+    Evaluate a Nix expression which produces a derivation, and return the
+    store-path of that derivation. All arguments are passed directly to
+    nix-instantiate.
+
+    Raises subprocess.CalledProcessError on failure.
+    """
+
+    result = subprocess.run(
+        ('nix-instantiate',) + args,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    return lines[0]
+
+
+def realise(drv, *args, **kwargs):
+    """
+    Given the store-path of a Nix derivation, return the exit status from
+    building that derivation, which is 0 on success.
+
+    By default, stdout and stderr are inherited from the parent process, but
+    you can pass any keyword arguments for subprocess.run to change that and
+    other behavior.
+
+    Extra positional arguments are passed to nix-store, which might be useful
+    for options like --quiet or --no-build-output.
+    """
+
+    return subprocess.run(
+        ('nix-store', '--realise') + args + (drv,),
+        stdin=subprocess.DEVNULL,
+        universal_newlines=True,
+        **kwargs
+    ).returncode
+
+
+def read_log(drv):
+    """
+    Search the build log of a Nix derivation for agent output and return it.
+    """
+    log_process = subprocess.Popen(
+        ['nix-store', '--read-log', drv],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+    in_summary = False
+    with closing(log_process.stdout) as lines:
+        for line in lines:
+            line = line.rstrip('\r\n')
+            if line == '===== begin autobake-agent summary =====':
+                in_summary = True
+            elif line == '===== end autobake-agent summary =====':
+                return
+            elif in_summary:
+                yield line
+
+
+def find_packages_for_file(path):
+    if not path.startswith('/'):
+        path = '/' + path
+
+    log_process = subprocess.Popen(
+	[
+            'nix-locate',
+            '--minimal',
+            '--top-level', '--whole-name',
+            '--type', 'x', '--type', 'r', '--type', 's',
+            path,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+    )
+
+    with closing(log_process.stdout) as lines:
+        for line in lines:
+            yield line.rstrip('\r\n')
+
+
+if __name__ == '__main__':
+    from collections import defaultdict
+    from pathlib import Path
+    import sys
+
+    drv = instantiate(
+        '--show-trace',
+        '--arg', 'pkg', sys.argv[1],
+        Path(__file__).parent / 'build-agent',
+    )
+
+    exitcode = realise(drv)
+    print()
+    print(' *** trial build', 'SUCCESS' if exitcode == 0 else 'FAILED (status {})'.format(exitcode))
+    print()
+
+    all_packages = defaultdict(list)
+    multiple = defaultdict(list)
+    missing = []
+    for original_path in read_log(drv):
+        path = original_path
+        while True:
+            found = list(find_packages_for_file(path))
+
+            if len(found) == 1:
+                all_packages[found[0]].append(path)
+                break
+            elif found:
+                multiple[path] = found
+                break
+
+            # If there's another '/' left, remove the first component and
+            # check again.
+            try:
+                path = path[path.index('/', 1) + 1:]
+            except ValueError:
+                missing.append(original_path)
+                break
+
+    if all_packages:
+        print(' *** suggested dependencies:')
+        for package, paths in sorted(all_packages.items()):
+            print('-', package, 'for:')
+            for path in paths:
+                print('  -', path)
+        print()
+    else:
+        print(' *** no additional dependencies found')
+
+    if multiple:
+        print(' *** multiple possibly-satisfying choices:')
+        for path, packages in sorted(multiple.items()):
+            print('-', path, 'is available from:')
+            for package in packages:
+                print('  -', package)
+        print()
+
+    if missing:
+        print(' *** unsatisfiable paths:')
+        missing.sort()
+        for path in missing:
+            print('-', path)
+        print()

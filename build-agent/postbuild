@@ -187,42 +187,41 @@ if __name__ == "__main__":
     os.chdir(d.parent)
     base = d.name + '.'
 
-    traces = {}
+    trace = []
     with os.scandir() as it:
         for entry in it:
-            assert entry.name.startswith(base)
-            pid = entry.name[len(base):]
             with open(entry.name) as log:
-                traces[pid] = list(parse_one_trace(log))
-
-    trace = itertools.chain.from_iterable(traces.values())
+                trace.extend(parse_one_trace(log))
 
     parents = set()
     for event in trace:
         if event[1] != 'fork':
             parents.update(event[2].parents)
 
-    trace = itertools.chain.from_iterable(traces.values())
-
     found = [defaultdict(set), defaultdict(set)]
     for event in trace:
-        p = event[2]
         if event[1] == 'fork':
-            pass
-        elif ignore_filenames.fullmatch(p.name) or ignore_pathnames.search(str(p)):
-            pass
-        elif p not in parents:
+            continue
+        p = event[2]
+        if p not in parents and not ignore_filenames.fullmatch(p.name):
             found[event[0]][p.name].add(p.parent)
 
-    singletons = []
+    missing = []
     searches = defaultdict(list)
     for filename, searched in sorted(found[False].items()):
         if filename in found[True]:
             continue
 
-        searched = sorted(searched)
+        searched = sorted(
+            p for p in searched
+            if p.is_absolute()
+            if not ignore_pathnames.search(str(p / filename))
+        )
+        if not searched:
+            continue
+
         if len(searched) == 1:
-            singletons.append(str(searched.pop() / filename))
+            missing.append(str(searched.pop() / filename))
             continue
 
         while True:
@@ -233,23 +232,12 @@ if __name__ == "__main__":
             filename = Path(common_parent, filename)
             searched = [parent.parent for parent in searched]
 
-        searched = tuple(map(str, searched))
-        searches[searched].append(str(filename))
+        missing.append(str(filename))
 
     print()
     print('===== begin autobake-agent summary =====')
-
-    print('not found:')
-    for path in sorted(singletons):
-        print(' -', shlex.quote(path))
-
-    for searched, filenames in sorted(searches.items()):
-        print()
-        print('looked in:')
-        for parent in searched:
-            print(' -', shlex.quote(parent))
-        print('but did not find:')
-        for filename in filenames:
-            print(' -', shlex.quote(filename))
-
+    missing.sort()
+    for path in missing:
+        print(path)
     print('===== end autobake-agent summary =====')
+    print()
