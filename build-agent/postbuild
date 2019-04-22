@@ -111,10 +111,14 @@ if __name__ == "__main__":
         '_callImplicitHook *',
         'if *; then *; fi',
         'bin',
+        'doc',
         'include',
         'include-fixed',
         'lib',
+        'lib32',
         'lib64',
+        'libexec',
+        'sbin',
         'specs',
 
         # all nixpkgs runHook/runOneHook targets:
